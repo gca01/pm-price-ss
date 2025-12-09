@@ -281,14 +281,31 @@ def process_game(page: Page, game: GameInfo, game_index: int) -> GameScreenshotR
     )
 
     try:
-        # Make sure we're on the games page
-        if "sports/nba/games" not in page.url:
-            page.goto(POLYMARKET_NBA_URL)
-            page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-            time.sleep(2)
+        # Make sure we're on the games page and games are loaded
+        from .games_scraper import click_game_view, wait_for_games_to_load
+        from .config import RETRY_ATTEMPTS, RETRY_DELAY
+
+        # Retry loading the games page if needed
+        games_loaded = False
+        for attempt in range(RETRY_ATTEMPTS):
+            if "sports/nba/games" not in page.url:
+                page.goto(POLYMARKET_NBA_URL)
+                page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+
+            # Wait for game view buttons to be available
+            if wait_for_games_to_load(page):
+                games_loaded = True
+                break
+            else:
+                log_warning(f"Retry {attempt + 1}/{RETRY_ATTEMPTS} loading games page...")
+                page.goto(POLYMARKET_NBA_URL)
+                time.sleep(RETRY_DELAY)
+
+        if not games_loaded:
+            result.error_message = "Failed to load games page"
+            return result
 
         # Click into the game
-        from .games_scraper import click_game_view
         if not click_game_view(page, game_index):
             result.error_message = "Failed to click Game View"
             return result
@@ -334,7 +351,8 @@ def process_game(page: Page, game: GameInfo, game_index: int) -> GameScreenshotR
         try:
             page.goto(POLYMARKET_NBA_URL)
             page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
-            time.sleep(REQUEST_DELAY)
+            # Wait longer for the page to fully reload with all games
+            time.sleep(3)
         except Exception:
             pass
 

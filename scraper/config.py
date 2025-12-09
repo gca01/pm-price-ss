@@ -20,9 +20,9 @@ TIMEZONE = "US/Eastern"
 
 # Timing configuration
 REQUEST_DELAY = 2  # Seconds to wait between game page loads
-PAGE_LOAD_TIMEOUT = 30000  # Max milliseconds to wait for page elements
+PAGE_LOAD_TIMEOUT = 60000  # Max milliseconds to wait for page elements
 GRAPH_RENDER_WAIT = 3  # Additional seconds to wait for graph data to render
-NETWORK_IDLE_TIMEOUT = 10000  # Milliseconds to wait for network idle
+NETWORK_IDLE_TIMEOUT = 30000  # Milliseconds to wait for network idle
 
 # Retry configuration
 RETRY_ATTEMPTS = 3  # Number of retries on network failure

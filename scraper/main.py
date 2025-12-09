@@ -137,7 +137,8 @@ def run_scraper(
             for i, game in enumerate(games):
                 log_info(f"\n--- Processing game {i + 1}/{len(games)} ---")
 
-                result = process_game(page, game, i)
+                # Use game.page_index to click the correct game on the page
+                result = process_game(page, game, game.page_index)
                 results.append(result)
 
                 # Rate limiting between games

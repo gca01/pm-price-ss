@@ -36,6 +36,7 @@ class GameInfo:
     start_time: Optional[str]
     game_date: str
     url: Optional[str] = None
+    page_index: int = 0  # Index on the games page for clicking
 
     @property
     def game_id(self) -> str:
@@ -117,6 +118,7 @@ def extract_game_info_from_row(page: Page, game_index: int) -> Optional[GameInfo
             // Navigate up to find the game row container
             // Look for a container that has exactly 2 moneyline price buttons
             let container = gameViewEl;
+            let gameContainer = null;
             for (let i = 0; i < 20 && container; i++) {
                 container = container.parentElement;
                 if (!container) break;
@@ -143,9 +145,43 @@ def extract_game_info_from_row(page: Page, game_index: int) -> Optional[GameInfo
 
                 // We need exactly 2 moneyline prices for a valid game row
                 if (moneylinePrices.length === 2) {
-                    // Find time element (format like "1:00 PM")
+                    gameContainer = container;
+
+                    // Find time element (format like "1:00 PM" or "LIVE")
                     const timeMatch = container.innerText.match(/(\\d{1,2}:\\d{2}\\s*(?:AM|PM))/i);
-                    const startTime = timeMatch ? timeMatch[1] : null;
+                    const startTime = timeMatch ? timeMatch[1] : 'LIVE';
+
+                    // Find date by looking at previous siblings or parent's previous siblings
+                    // The date headers are like "Mon, December 8" or "Tue, December 9"
+                    let gameDate = null;
+                    let searchEl = gameContainer;
+
+                    // Search upward and backward for a date header
+                    for (let j = 0; j < 50 && !gameDate && searchEl; j++) {
+                        // Check previous siblings
+                        let sibling = searchEl.previousElementSibling;
+                        while (sibling && !gameDate) {
+                            const sibText = sibling.innerText || '';
+                            // Match patterns like "Mon, December 8" or "Tue, December 9"
+                            const dateMatch = sibText.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\s+(\\d{1,2})/i);
+                            if (dateMatch) {
+                                const fullMatch = dateMatch[0];
+                                const monthMatch = fullMatch.match(/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i);
+                                const dayMatch = fullMatch.match(/(\\d{1,2})$/);
+                                if (monthMatch && dayMatch) {
+                                    const monthStr = monthMatch[0].substring(0, 3);
+                                    const day = parseInt(dayMatch[1]);
+                                    const months = {Jan:1, Feb:2, Mar:3, Apr:4, May:5, Jun:6, Jul:7, Aug:8, Sep:9, Oct:10, Nov:11, Dec:12};
+                                    const month = months[monthStr.charAt(0).toUpperCase() + monthStr.slice(1,3).toLowerCase()];
+                                    const year = new Date().getFullYear();
+                                    gameDate = `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+                                }
+                            }
+                            sibling = sibling.previousElementSibling;
+                        }
+                        // Move up to parent and continue searching
+                        searchEl = searchEl.parentElement;
+                    }
 
                     // First team in the row is away, second is home
                     return {
@@ -153,7 +189,8 @@ def extract_game_info_from_row(page: Page, game_index: int) -> Optional[GameInfo
                         home: moneylinePrices[1].team,
                         awayPrice: moneylinePrices[0].price,
                         homePrice: moneylinePrices[1].price,
-                        startTime: startTime
+                        startTime: startTime,
+                        gameDate: gameDate
                     };
                 }
             }
@@ -164,11 +201,14 @@ def extract_game_info_from_row(page: Page, game_index: int) -> Optional[GameInfo
         )
 
         if game_data:
+            # Use extracted date if available, otherwise fall back to today
+            game_date = game_data.get("gameDate") or get_today_date_str()
             return GameInfo(
                 home=game_data["home"],
                 away=game_data["away"],
                 start_time=game_data.get("startTime"),
-                game_date=get_today_date_str(),
+                game_date=game_date,
+                page_index=game_index,
             )
 
     except Exception as e:
@@ -219,15 +259,17 @@ def get_games_for_today(page: Page) -> List[GameInfo]:
         else:
             log_warning(f"Could not extract info for game {i + 1}")
 
-    # Deduplicate games (in case same game was found multiple times)
+    # Filter to only today's games and deduplicate
     seen_ids = set()
     unique_games = []
     for game in games:
-        if game.game_id not in seen_ids:
+        if game.game_id not in seen_ids and game.game_date == today:
             seen_ids.add(game.game_id)
             unique_games.append(game)
+        elif game.game_date != today:
+            log_info(f"Skipping game {game} - not today's date ({game.game_date})")
 
-    log_info(f"Successfully extracted {len(unique_games)} unique games")
+    log_info(f"Successfully extracted {len(unique_games)} games for today")
     return unique_games
 
 
