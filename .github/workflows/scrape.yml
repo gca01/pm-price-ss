@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout main branch (code)
+      - name: Checkout master branch (code)
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: master
           path: code
 
       - name: Checkout data branch
