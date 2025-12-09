@@ -31,8 +31,8 @@ from .config import (
     EXCEL_FILE_PATH,
 )
 from .games_scraper import get_games_for_today, GameInfo
-from .game_screenshotter import process_game, GameScreenshotResult
-from .excel_writer import append_results, get_entry_count, get_sheet_names
+from .game_screenshotter import process_game, process_game_by_url, GameScreenshotResult
+from .excel_writer import append_results, get_entry_count, get_sheet_names, get_existing_games, GameState
 from .utils import (
     get_today_date_str,
     get_eastern_now,
@@ -65,6 +65,7 @@ def print_summary(results: List[GameScreenshotResult]):
     table.add_column("Home Price", justify="right")
     table.add_column("Away Price", justify="right")
     table.add_column("Screenshot", style="green")
+    table.add_column("Final", justify="center")
     table.add_column("Status")
 
     for result in results:
@@ -72,12 +73,14 @@ def print_summary(results: List[GameScreenshotResult]):
         home_price = f"{result.home_price:.2f}" if result.home_price else "-"
         away_price = f"{result.away_price:.2f}" if result.away_price else "-"
         screenshot = "Yes" if result.screenshot_path else "No"
+        is_final = "[bold green]FINAL[/bold green]" if result.is_final else "-"
 
         table.add_row(
             str(result.game),
             home_price,
             away_price,
             screenshot,
+            is_final,
             status,
         )
 
@@ -110,6 +113,14 @@ def run_scraper(
     # Ensure screenshot directory exists
     ensure_screenshot_dir(today)
 
+    # Get existing games from Excel for today
+    existing_games = get_existing_games(EXCEL_FILE_PATH, today)
+    if existing_games:
+        log_info(f"Found {len(existing_games)} existing games in Excel for today")
+        for game_id, state in existing_games.items():
+            status = "FINAL" if state.is_final else "in progress"
+            log_info(f"  - {game_id}: {status}")
+
     with sync_playwright() as p:
         # Launch browser
         log_info("Launching browser...")
@@ -118,22 +129,18 @@ def run_scraper(
         page = context.new_page()
 
         try:
-            # Get today's games
+            # Get today's games from Polymarket
             games = get_games_for_today(page)
+            today_game_ids = {game.game_id for game in games}
 
-            if not games:
-                log_warning("No games found for today. Exiting.")
-                browser.close()
-                return results
-
-            log_info(f"Found {len(games)} games to process")
+            log_info(f"Found {len(games)} games on Polymarket for today")
 
             # Limit games if specified
             if max_games is not None and max_games > 0:
                 games = games[:max_games]
                 log_info(f"Limited to {len(games)} games")
 
-            # Process each game
+            # Process each game from today's page
             for i, game in enumerate(games):
                 log_info(f"\n--- Processing game {i + 1}/{len(games)} ---")
 
@@ -145,6 +152,53 @@ def run_scraper(
                 if i < len(games) - 1:
                     log_info(f"Waiting {REQUEST_DELAY}s before next game...")
                     time.sleep(REQUEST_DELAY)
+
+            # Process games that are in Excel but no longer on today's page
+            # (games that may have ended and been removed from the main list)
+            games_to_check_by_url = []
+            for game_id, state in existing_games.items():
+                if game_id not in today_game_ids:
+                    if state.is_final:
+                        log_info(f"Skipping {game_id} - already marked as FINAL")
+                    elif state.url:
+                        log_info(f"Game {game_id} not on today's page, will check by URL")
+                        games_to_check_by_url.append(state)
+                    else:
+                        log_warning(f"Game {game_id} not on today's page and no URL stored - skipping")
+
+            # Process games by URL
+            if games_to_check_by_url:
+                log_info(f"\n=== Processing {len(games_to_check_by_url)} games by URL ===")
+
+                for i, state in enumerate(games_to_check_by_url):
+                    log_info(f"\n--- Processing game by URL {i + 1}/{len(games_to_check_by_url)} ---")
+
+                    # Create a GameInfo from the stored state
+                    # Parse game_id format: "YYYY-MM-DD_Away_Home"
+                    parts = state.game_id.split("_")
+                    if len(parts) >= 3:
+                        game_date = parts[0]
+                        away_team = parts[1]
+                        home_team = parts[2]
+
+                        game = GameInfo(
+                            home=home_team,
+                            away=away_team,
+                            start_time=None,
+                            game_date=game_date,
+                            url=state.url,
+                            page_index=-1,  # Not on page
+                        )
+
+                        result = process_game_by_url(page, game)
+                        results.append(result)
+
+                        # Rate limiting
+                        if i < len(games_to_check_by_url) - 1:
+                            log_info(f"Waiting {REQUEST_DELAY}s before next game...")
+                            time.sleep(REQUEST_DELAY)
+                    else:
+                        log_warning(f"Could not parse game_id: {state.game_id}")
 
         except Exception as e:
             log_error(f"Error during scraping: {e}")

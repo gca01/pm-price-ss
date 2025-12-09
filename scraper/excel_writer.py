@@ -9,16 +9,17 @@ Structure:
 Layout example for a sheet:
     |  Col A-B (Game 1)  |  Col C-D (Game 2)  |  Col E-F (Game 3)  |
 Row 1: SAC @ IND           PHX @ MIN            MIA @ ORL
-Row 2: 1:00 PM             1:30 PM              2:00 PM
-Row 3: [Screenshot 1]      [Screenshot 1]       [Screenshot 1]
-Row 4: 39¢ / 62¢           22¢ / 79¢            50¢ / 50¢
-Row 5: 06:00 AM            06:00 AM             06:00 AM
-Row 6: [Screenshot 2]      [Screenshot 2]       [Screenshot 2]
-Row 7: 40¢ / 61¢           23¢ / 78¢            51¢ / 49¢
-Row 8: 07:00 AM            07:00 AM             07:00 AM
+Row 2: 1:00 PM / 2025-12-08  1:30 PM / 2025-12-08  2:00 PM / 2025-12-08
+Row 3: https://polymarket... https://polymarket... https://polymarket...
+Row 4: [Screenshot 1]      [Screenshot 1]       [Screenshot 1]
+Row 5: Captured: 06:00 AM  Captured: 06:00 AM   Captured: 06:00 AM
+Row 6: (blank)             (blank)              (blank)
+Row 7: [Screenshot 2]      [Screenshot 2]       [Screenshot 2]
+Row 8: Captured: 07:00 AM - FINAL  Captured: 07:00 AM  Captured: 07:00 AM
 ...
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime
@@ -34,10 +35,106 @@ from .game_screenshotter import GameScreenshotResult
 
 # Layout constants
 COLUMNS_PER_GAME = 3  # Each game takes 2 columns + 1 spacer column
-HEADER_ROWS = 2  # Row 1: Game title, Row 2: Start time
+HEADER_ROWS = 3  # Row 1: Game title, Row 2: Start time, Row 3: URL
 ROWS_PER_ENTRY = 3  # Each hourly entry: Screenshot, Capture time, blank row
 IMAGE_WIDTH = 350  # Screenshot width in pixels for Excel
 IMAGE_HEIGHT = 150  # Screenshot height in pixels for Excel
+
+
+@dataclass
+class GameState:
+    """State of a game in the Excel sheet."""
+    game_id: str
+    url: Optional[str]
+    is_final: bool
+    column: int
+
+
+def get_games_from_sheet(ws) -> Dict[str, GameState]:
+    """
+    Get all games from a worksheet with their current state.
+
+    Args:
+        ws: Worksheet to read from
+
+    Returns:
+        Dict mapping game_id to GameState (url, is_final, column)
+    """
+    games = {}
+
+    col = 1
+    while col <= ws.max_column:
+        title_cell = ws.cell(row=1, column=col).value
+        if not title_cell:
+            col += COLUMNS_PER_GAME
+            continue
+
+        # Extract game_id from title (format: "Away @ Home")
+        # We need to look at the date in row 2 to construct full game_id
+        time_cell = ws.cell(row=2, column=col).value
+        url_cell = ws.cell(row=3, column=col).value
+
+        # Parse date from time cell (format: "HH:MM AM/PM / YYYY-MM-DD")
+        game_date = None
+        if time_cell and "/" in str(time_cell):
+            parts = str(time_cell).split("/")
+            if len(parts) >= 2:
+                game_date = parts[-1].strip()
+
+        # Parse teams from title (format: "Away @ Home")
+        away_team = None
+        home_team = None
+        if title_cell and "@" in str(title_cell):
+            parts = str(title_cell).split("@")
+            if len(parts) == 2:
+                away_team = parts[0].strip()
+                home_team = parts[1].strip()
+
+        if game_date and away_team and home_team:
+            game_id = f"{game_date}_{away_team}_{home_team}"
+
+            # Check if the game is final by looking at the last timestamp entry
+            is_final = is_game_final(ws, col)
+
+            games[game_id] = GameState(
+                game_id=game_id,
+                url=str(url_cell) if url_cell else None,
+                is_final=is_final,
+                column=col
+            )
+
+        col += COLUMNS_PER_GAME
+
+    return games
+
+
+def is_game_final(ws, game_col: int) -> bool:
+    """
+    Check if a game's last entry is marked as Final.
+
+    Args:
+        ws: Worksheet
+        game_col: Column number for the game
+
+    Returns:
+        True if the last entry contains "FINAL"
+    """
+    # Find the last entry row for this game
+    row = HEADER_ROWS + 1
+    last_timestamp_row = None
+
+    while row <= ws.max_row:
+        timestamp_cell = ws.cell(row=row + 1, column=game_col).value
+        if timestamp_cell:
+            last_timestamp_row = row + 1
+        row += ROWS_PER_ENTRY
+
+    if last_timestamp_row:
+        timestamp_value = ws.cell(row=last_timestamp_row, column=game_col).value
+        if timestamp_value and "FINAL" in str(timestamp_value).upper():
+            return True
+
+    return False
 
 
 def get_or_create_workbook(filepath: Path) -> Workbook:
@@ -169,6 +266,18 @@ def setup_game_header(ws, game_col: int, result: GameScreenshotResult):
         end_row=2, end_column=game_col + 1
     )
 
+    # Row 3: URL
+    url_cell = ws.cell(row=3, column=game_col)
+    url_cell.value = game.url or ""
+    url_cell.font = Font(size=8, color="0066CC", underline="single")
+    url_cell.alignment = center_align
+
+    # Merge cells for URL (only 2 columns)
+    ws.merge_cells(
+        start_row=3, start_column=game_col,
+        end_row=3, end_column=game_col + 1
+    )
+
     # Set column widths (2 content columns + 1 narrow spacer)
     ws.column_dimensions[get_column_letter(game_col)].width = 25
     ws.column_dimensions[get_column_letter(game_col + 1)].width = 25
@@ -227,8 +336,14 @@ def add_entry_to_game(ws, game_col: int, entry_row: int, result: GameScreenshotR
     timestamp = get_eastern_now().strftime("%I:%M %p")
 
     time_cell = ws.cell(row=time_row, column=game_col)
-    time_cell.value = f"Captured: {timestamp}"
-    time_cell.font = Font(size=9, italic=True, color="666666")
+    # Check if this result is marked as final
+    is_final = getattr(result, 'is_final', False)
+    if is_final:
+        time_cell.value = f"Captured: {timestamp} - FINAL"
+        time_cell.font = Font(size=9, italic=True, bold=True, color="008000")  # Green for final
+    else:
+        time_cell.value = f"Captured: {timestamp}"
+        time_cell.font = Font(size=9, italic=True, color="666666")
     time_cell.alignment = center_align
 
     # Merge timestamp cells (only 2 columns, not the spacer)
@@ -427,3 +542,41 @@ def get_entry_count(filepath: Optional[Path] = None, date_str: Optional[str] = N
     except Exception as e:
         log_error(f"Error getting entry count: {e}")
         return counts
+
+
+def get_existing_games(filepath: Optional[Path] = None, date_str: Optional[str] = None) -> Dict[str, GameState]:
+    """
+    Get all existing games from the Excel file for a specific date.
+
+    Args:
+        filepath: Path to Excel file
+        date_str: Date to check (uses today if None)
+
+    Returns:
+        Dict mapping game_id to GameState
+    """
+    if filepath is None:
+        filepath = EXCEL_FILE_PATH
+    if date_str is None:
+        date_str = get_today_date_str()
+
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        return {}
+
+    try:
+        wb = load_workbook(filepath)
+
+        if date_str not in wb.sheetnames:
+            wb.close()
+            return {}
+
+        ws = wb[date_str]
+        games = get_games_from_sheet(ws)
+        wb.close()
+        return games
+
+    except Exception as e:
+        log_error(f"Error getting existing games: {e}")
+        return {}

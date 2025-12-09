@@ -63,8 +63,11 @@ jobs:
 
       - name: Copy results to data directory
         run: |
-          cp code/nba_polymarket_prices.xlsx data/ 2>/dev/null || true
-          cp -r code/screenshots data/ 2>/dev/null || true
+          echo "Copying results..."
+          cp code/nba_polymarket_prices.xlsx data/ 2>/dev/null && echo "Copied Excel file" || echo "No Excel file to copy"
+          cp -r code/screenshots data/ 2>/dev/null && echo "Copied screenshots" || echo "No screenshots to copy"
+          echo "Data directory contents:"
+          ls -la data/
 
       - name: Commit and push to data branch
         working-directory: data
@@ -73,7 +76,12 @@ jobs:
           git config user.email "actions@github.com"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git 2>/dev/null || \
             git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          echo "Git status before add:"
+          git status
           git add -A
+          echo "Git status after add:"
+          git status
           git commit -m "Update NBA prices - $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
-          # Push current branch (HEAD) to remote data branch
+          echo "Pushing to data branch..."
           git push origin HEAD:data --force
+          echo "Push completed"

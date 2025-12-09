@@ -48,6 +48,32 @@ class GameScreenshotResult:
     away_price: Optional[float]
     success: bool
     error_message: Optional[str] = None
+    is_final: bool = False  # True if game has ended (shows "Final" on page)
+
+
+def check_if_game_final(page: Page) -> bool:
+    """
+    Check if the game page shows "Final" (game has ended).
+
+    Args:
+        page: Playwright page object (should be on a game detail page)
+
+    Returns:
+        True if the game shows "Final" status, False otherwise
+    """
+    try:
+        # Look for "Final" text on the page (appears as a badge/pill at top of game card)
+        final_locator = page.get_by_text("Final", exact=True)
+
+        # Check if the Final element exists and is visible
+        if final_locator.count() > 0:
+            log_info("Game shows 'Final' status - game has ended")
+            return True
+
+        return False
+    except Exception as e:
+        log_warning(f"Error checking if game is final: {e}")
+        return False
 
 
 def navigate_to_moneyline(page: Page) -> bool:
@@ -310,6 +336,13 @@ def process_game(page: Page, game: GameInfo, game_index: int) -> GameScreenshotR
             result.error_message = "Failed to click Game View"
             return result
 
+        # Capture the game URL from the browser address bar
+        game.url = page.url
+        log_info(f"Captured game URL: {game.url}")
+
+        # Check if the game has ended (shows "Final")
+        result.is_final = check_if_game_final(page)
+
         # Navigate to Moneyline
         if not navigate_to_moneyline(page):
             result.error_message = "No Moneyline market available"
@@ -355,5 +388,98 @@ def process_game(page: Page, game: GameInfo, game_index: int) -> GameScreenshotR
             time.sleep(3)
         except Exception:
             pass
+
+    return result
+
+
+def process_game_by_url(page: Page, game: GameInfo) -> GameScreenshotResult:
+    """
+    Process a game by navigating directly to its URL.
+
+    Used for games that are no longer on the "Today's games" page
+    but we have the URL stored from a previous scrape.
+
+    Args:
+        page: Playwright page object
+        game: GameInfo object with url field populated
+
+    Returns:
+        GameScreenshotResult with all captured data
+    """
+    log_info(f"Processing game by URL: {game} -> {game.url}")
+
+    result = GameScreenshotResult(
+        game=game,
+        screenshot_path=None,
+        home_price=None,
+        away_price=None,
+        success=False,
+    )
+
+    if not game.url:
+        result.error_message = "No URL available for game"
+        return result
+
+    try:
+        from .config import RETRY_ATTEMPTS, RETRY_DELAY
+
+        # Navigate directly to the game URL
+        navigated = False
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                page.goto(game.url)
+                page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT)
+                time.sleep(2)  # Wait for content to render
+                navigated = True
+                break
+            except Exception as e:
+                log_warning(f"Retry {attempt + 1}/{RETRY_ATTEMPTS} navigating to game URL: {e}")
+                time.sleep(RETRY_DELAY)
+
+        if not navigated:
+            result.error_message = "Failed to navigate to game URL"
+            return result
+
+        # Check if the game has ended (shows "Final")
+        result.is_final = check_if_game_final(page)
+
+        # Navigate to Moneyline
+        if not navigate_to_moneyline(page):
+            result.error_message = "No Moneyline market available"
+            return result
+
+        # Navigate to Graph
+        if not navigate_to_graph(page):
+            result.error_message = "Failed to navigate to Graph"
+            return result
+
+        # Select 6H time period
+        if not select_time_period(page, "6H"):
+            result.error_message = "Failed to select 6H time period"
+            return result
+
+        # Wait for chart to render
+        if not wait_for_chart(page):
+            result.error_message = "Chart failed to render"
+            return result
+
+        # Extract prices
+        result.home_price, result.away_price = extract_moneyline_prices(page, game)
+
+        # Capture screenshot
+        result.screenshot_path = capture_chart_screenshot(page, game)
+
+        if result.screenshot_path:
+            result.success = True
+            if result.is_final:
+                log_success(f"Successfully captured FINAL screenshot for {game}")
+            else:
+                log_success(f"Successfully processed {game}")
+        else:
+            result.error_message = "Screenshot capture failed"
+
+    except Exception as e:
+        result.error_message = str(e)
+        log_error(f"Error processing game by URL {game}: {e}")
 
     return result
