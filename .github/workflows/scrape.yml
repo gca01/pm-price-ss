@@ -1,0 +1,78 @@
+name: Scrape Polymarket NBA Prices
+
+on:
+  schedule:
+    # Run every hour at minute 5 (gives time for games to update)
+    - cron: '5 * * * *'
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main branch (code)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: code
+
+      - name: Checkout data branch
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: data
+        continue-on-error: true  # Branch may not exist yet
+
+      - name: Initialize data directory if needed
+        run: |
+          if [ ! -d "data/.git" ]; then
+            mkdir -p data
+            cd data
+            git init
+            git checkout -b data
+            echo "# NBA Polymarket Price Data" > README.md
+            echo "" >> README.md
+            echo "This branch contains scraped data from the Polymarket NBA scraper." >> README.md
+            echo "" >> README.md
+            echo "- \`nba_polymarket_prices.xlsx\` - Excel file with embedded screenshots" >> README.md
+            echo "- \`screenshots/\` - Raw screenshot images" >> README.md
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: code
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps
+
+      - name: Copy existing data to code directory
+        run: |
+          # Copy existing Excel and screenshots if they exist
+          cp data/nba_polymarket_prices.xlsx code/ 2>/dev/null || true
+          cp -r data/screenshots code/ 2>/dev/null || true
+
+      - name: Run scraper
+        working-directory: code
+        run: python3 -m scraper.main --headless
+
+      - name: Copy results to data directory
+        run: |
+          cp code/nba_polymarket_prices.xlsx data/ 2>/dev/null || true
+          cp -r code/screenshots data/ 2>/dev/null || true
+
+      - name: Commit and push to data branch
+        working-directory: data
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git || \
+            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git add -A
+          git commit -m "Update NBA prices - $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
+          git push origin data --force-with-lease || git push origin data --set-upstream

@@ -32,7 +32,7 @@ from .config import (
 )
 from .games_scraper import get_games_for_today, GameInfo
 from .game_screenshotter import process_game, GameScreenshotResult
-from .excel_writer import append_results, get_row_count
+from .excel_writer import append_results, get_entry_count, get_sheet_names
 from .utils import (
     get_today_date_str,
     get_eastern_now,
@@ -205,9 +205,12 @@ def main(
     if not dry_run and results:
         log_info("\nSaving results to Excel...")
         appended = append_results(results, EXCEL_FILE_PATH)
-        total_rows = get_row_count(EXCEL_FILE_PATH)
+        today = get_today_date_str()
+        entry_counts = get_entry_count(EXCEL_FILE_PATH, today)
+        sheets = get_sheet_names(EXCEL_FILE_PATH)
         console.print(f"[bold]Excel file:[/bold] {EXCEL_FILE_PATH}")
-        console.print(f"[bold]Total rows:[/bold] {total_rows}")
+        console.print(f"[bold]Date sheets:[/bold] {len(sheets)} ({', '.join(sheets[-3:]) if sheets else 'none'})")
+        console.print(f"[bold]Entries today:[/bold] {sum(entry_counts.values())} across {len(entry_counts)} games")
     elif dry_run:
         log_info("\n[yellow]Dry run - results not saved to Excel[/yellow]")
 

@@ -1,88 +1,243 @@
 """
 Excel writer for Polymarket NBA price data.
 
-Handles creating and appending data to the Excel output file.
+Structure:
+- One sheet per date (e.g., "2025-12-08")
+- Games arranged horizontally (each game in its own column group)
+- Screenshots stacked vertically for each game as time progresses
+
+Layout example for a sheet:
+    |  Col A-B (Game 1)  |  Col C-D (Game 2)  |  Col E-F (Game 3)  |
+Row 1: SAC @ IND           PHX @ MIN            MIA @ ORL
+Row 2: 1:00 PM             1:30 PM              2:00 PM
+Row 3: [Screenshot 1]      [Screenshot 1]       [Screenshot 1]
+Row 4: 39¢ / 62¢           22¢ / 79¢            50¢ / 50¢
+Row 5: 06:00 AM            06:00 AM             06:00 AM
+Row 6: [Screenshot 2]      [Screenshot 2]       [Screenshot 2]
+Row 7: 40¢ / 61¢           23¢ / 78¢            51¢ / 49¢
+Row 8: 07:00 AM            07:00 AM             07:00 AM
+...
 """
 
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
+from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 
-from .config import EXCEL_FILE_PATH, EXCEL_HEADERS
-from .utils import get_iso_timestamp, log_info, log_success, log_error
+from .config import EXCEL_FILE_PATH
+from .utils import get_today_date_str, get_eastern_now, log_info, log_success, log_error, log_warning
 from .game_screenshotter import GameScreenshotResult
 
+# Layout constants
+COLUMNS_PER_GAME = 3  # Each game takes 2 columns + 1 spacer column
+HEADER_ROWS = 2  # Row 1: Game title, Row 2: Start time
+ROWS_PER_ENTRY = 3  # Each hourly entry: Screenshot, Capture time, blank row
+IMAGE_WIDTH = 350  # Screenshot width in pixels for Excel
+IMAGE_HEIGHT = 150  # Screenshot height in pixels for Excel
 
-def create_workbook_with_headers(filepath: Path) -> Workbook:
+
+def get_or_create_workbook(filepath: Path) -> Workbook:
+    """Load existing workbook or create a new one."""
+    if filepath.exists():
+        return load_workbook(filepath)
+    return Workbook()
+
+
+def get_or_create_date_sheet(wb: Workbook, date_str: str):
+    """Get or create a sheet for the given date."""
+    # Clean sheet name (Excel doesn't allow certain characters)
+    sheet_name = date_str  # Format: YYYY-MM-DD
+
+    if sheet_name in wb.sheetnames:
+        return wb[sheet_name]
+
+    # Create new sheet
+    ws = wb.create_sheet(title=sheet_name)
+
+    # Remove default sheet if it exists and is empty
+    if "Sheet" in wb.sheetnames:
+        default_sheet = wb["Sheet"]
+        if default_sheet.max_row == 1 and default_sheet.max_column == 1:
+            wb.remove(default_sheet)
+
+    return ws
+
+
+def find_game_column(ws, game_id: str) -> Optional[int]:
     """
-    Create a new workbook with headers.
+    Find the column where a game is located.
 
     Args:
-        filepath: Path where the workbook will be saved
+        ws: Worksheet
+        game_id: Game ID to find
 
     Returns:
-        New Workbook object with headers
+        Column number (1-based) or None if not found
     """
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "NBA Prices"
-
-    # Add headers
-    for col, header in enumerate(EXCEL_HEADERS, start=1):
-        cell = ws.cell(row=1, column=col, value=header)
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center")
-        cell.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
-
-    # Set column widths
-    column_widths = {
-        "Timestamp": 25,
-        "Game ID": 30,
-        "Home Team": 12,
-        "Away Team": 12,
-        "Home Price": 12,
-        "Away Price": 12,
-        "Game Start": 15,
-        "Screenshot Path": 60,
-    }
-
-    for col, header in enumerate(EXCEL_HEADERS, start=1):
-        width = column_widths.get(header, 15)
-        ws.column_dimensions[get_column_letter(col)].width = width
-
-    # Save the workbook
-    wb.save(filepath)
-    log_success(f"Created new Excel file: {filepath}")
-
-    return wb
+    # Check row 1 for game IDs (stored in header)
+    for col in range(1, ws.max_column + 1, COLUMNS_PER_GAME):
+        cell_value = ws.cell(row=1, column=col).value
+        if cell_value and game_id in str(cell_value):
+            return col
+    return None
 
 
-def ensure_workbook(filepath: Optional[Path] = None) -> Path:
+def get_next_game_column(ws) -> int:
+    """Get the next available column for a new game."""
+    if ws.max_column <= 1 and ws.cell(row=1, column=1).value is None:
+        return 1
+
+    # Find the next empty column group
+    col = 1
+    while ws.cell(row=1, column=col).value is not None:
+        col += COLUMNS_PER_GAME
+    return col
+
+
+def get_next_entry_row(ws, game_col: int) -> int:
     """
-    Ensure the Excel workbook exists, creating it if necessary.
+    Get the next available row for a new entry in a game column.
 
     Args:
-        filepath: Path to the Excel file. Uses default if None.
+        ws: Worksheet
+        game_col: Column number for the game
 
     Returns:
-        Path to the Excel file
+        Row number for the next entry
     """
-    if filepath is None:
-        filepath = EXCEL_FILE_PATH
+    # Start after header rows
+    row = HEADER_ROWS + 1
 
-    filepath = Path(filepath)
+    # Find the next empty entry slot
+    while ws.cell(row=row, column=game_col).value is not None:
+        row += ROWS_PER_ENTRY
 
-    if not filepath.exists():
-        # Create parent directories if needed
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        create_workbook_with_headers(filepath)
+    return row
+
+
+def setup_game_header(ws, game_col: int, result: GameScreenshotResult):
+    """
+    Set up the header rows for a new game.
+
+    Args:
+        ws: Worksheet
+        game_col: Starting column for this game
+        result: GameScreenshotResult with game info
+    """
+    game = result.game
+
+    # Style definitions
+    header_font = Font(bold=True, size=12)
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    white_font = Font(bold=True, size=12, color="FFFFFF")
+    center_align = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+
+    # Row 1: Game title (Away @ Home)
+    title_cell = ws.cell(row=1, column=game_col)
+    title_cell.value = f"{game.away} @ {game.home}"
+    title_cell.font = white_font
+    title_cell.fill = header_fill
+    title_cell.alignment = center_align
+    title_cell.border = thin_border
+
+    # Merge cells for title (only 2 columns, leave 3rd as spacer)
+    ws.merge_cells(
+        start_row=1, start_column=game_col,
+        end_row=1, end_column=game_col + 1
+    )
+
+    # Row 2: Start time and Date
+    time_cell = ws.cell(row=2, column=game_col)
+    time_cell.value = f"{game.start_time or 'TBD'} / {game.game_date}"
+    time_cell.font = Font(size=10, italic=True)
+    time_cell.alignment = center_align
+    time_cell.border = thin_border
+
+    # Merge cells for time (only 2 columns)
+    ws.merge_cells(
+        start_row=2, start_column=game_col,
+        end_row=2, end_column=game_col + 1
+    )
+
+    # Set column widths (2 content columns + 1 narrow spacer)
+    ws.column_dimensions[get_column_letter(game_col)].width = 25
+    ws.column_dimensions[get_column_letter(game_col + 1)].width = 25
+    ws.column_dimensions[get_column_letter(game_col + 2)].width = 3  # Spacer column
+
+
+def add_entry_to_game(ws, game_col: int, entry_row: int, result: GameScreenshotResult):
+    """
+    Add a single entry (screenshot + prices + timestamp) to a game column.
+
+    Args:
+        ws: Worksheet
+        game_col: Starting column for this game
+        entry_row: Row to start this entry
+        result: GameScreenshotResult with data
+    """
+    center_align = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+
+    # Row 1 of entry: Screenshot
+    if result.screenshot_path and Path(result.screenshot_path).exists():
+        try:
+            img = XLImage(str(result.screenshot_path))
+            # Scale image to fit
+            img.width = IMAGE_WIDTH
+            img.height = IMAGE_HEIGHT
+
+            # Position the image
+            cell_ref = f"{get_column_letter(game_col)}{entry_row}"
+            ws.add_image(img, cell_ref)
+
+            # Set row height to accommodate image
+            ws.row_dimensions[entry_row].height = IMAGE_HEIGHT * 0.75  # Convert to points
+
+            log_success(f"Embedded screenshot at {cell_ref}")
+        except Exception as e:
+            log_warning(f"Could not embed image: {e}")
+            # Fall back to path
+            ws.cell(row=entry_row, column=game_col).value = str(result.screenshot_path)
     else:
-        log_info(f"Using existing Excel file: {filepath}")
+        ws.cell(row=entry_row, column=game_col).value = "No screenshot"
 
-    return filepath
+    # Merge cells for screenshot row (only 2 columns, not the spacer)
+    ws.merge_cells(
+        start_row=entry_row, start_column=game_col,
+        end_row=entry_row, end_column=game_col + 1
+    )
+
+    # Row 2 of entry: Capture timestamp
+    time_row = entry_row + 1
+    timestamp = get_eastern_now().strftime("%I:%M %p")
+
+    time_cell = ws.cell(row=time_row, column=game_col)
+    time_cell.value = f"Captured: {timestamp}"
+    time_cell.font = Font(size=9, italic=True, color="666666")
+    time_cell.alignment = center_align
+
+    # Merge timestamp cells (only 2 columns, not the spacer)
+    ws.merge_cells(
+        start_row=time_row, start_column=game_col,
+        end_row=time_row, end_column=game_col + 1
+    )
+
+    # Row 3 of entry: blank row (spacer between entries)
 
 
 def append_result(result: GameScreenshotResult, filepath: Optional[Path] = None) -> bool:
@@ -96,36 +251,42 @@ def append_result(result: GameScreenshotResult, filepath: Optional[Path] = None)
     Returns:
         True if append succeeded, False otherwise
     """
+    if filepath is None:
+        filepath = EXCEL_FILE_PATH
+
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
     try:
-        filepath = ensure_workbook(filepath)
+        wb = get_or_create_workbook(filepath)
+        ws = get_or_create_date_sheet(wb, result.game.game_date)
 
-        wb = load_workbook(filepath)
-        ws = wb.active
+        # Find or create column for this game
+        game_col = find_game_column(ws, result.game.game_id)
 
-        # Prepare row data
-        row_data = [
-            get_iso_timestamp(),
-            result.game.game_id,
-            result.game.home,
-            result.game.away,
-            result.home_price if result.home_price is not None else "",
-            result.away_price if result.away_price is not None else "",
-            result.game.start_time or "",
-            str(result.screenshot_path) if result.screenshot_path else "",
-        ]
+        if game_col is None:
+            # New game - set up header
+            game_col = get_next_game_column(ws)
+            setup_game_header(ws, game_col, result)
+            log_info(f"Created new game column at {game_col} for {result.game}")
 
-        # Append the row
-        ws.append(row_data)
+        # Find next entry row for this game
+        entry_row = get_next_entry_row(ws, game_col)
+
+        # Add the entry
+        add_entry_to_game(ws, game_col, entry_row, result)
 
         # Save
         wb.save(filepath)
         wb.close()
 
-        log_success(f"Appended row for {result.game.game_id}")
+        log_success(f"Added entry for {result.game.game_id} at row {entry_row}")
         return True
 
     except Exception as e:
         log_error(f"Error appending to Excel: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -138,44 +299,53 @@ def append_results(results: List[GameScreenshotResult], filepath: Optional[Path]
         filepath: Path to the Excel file. Uses default if None.
 
     Returns:
-        Number of successfully appended rows
+        Number of successfully appended entries
     """
     if not results:
         log_info("No results to append")
         return 0
 
+    if filepath is None:
+        filepath = EXCEL_FILE_PATH
+
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    appended = 0
+
     try:
-        filepath = ensure_workbook(filepath)
-
-        wb = load_workbook(filepath)
-        ws = wb.active
-
-        appended = 0
-        timestamp = get_iso_timestamp()
+        wb = get_or_create_workbook(filepath)
 
         for result in results:
             if not result.success:
                 continue
 
-            row_data = [
-                timestamp,
-                result.game.game_id,
-                result.game.home,
-                result.game.away,
-                result.home_price if result.home_price is not None else "",
-                result.away_price if result.away_price is not None else "",
-                result.game.start_time or "",
-                str(result.screenshot_path) if result.screenshot_path else "",
-            ]
+            try:
+                ws = get_or_create_date_sheet(wb, result.game.game_date)
 
-            ws.append(row_data)
-            appended += 1
+                # Find or create column for this game
+                game_col = find_game_column(ws, result.game.game_id)
+
+                if game_col is None:
+                    game_col = get_next_game_column(ws)
+                    setup_game_header(ws, game_col, result)
+
+                # Find next entry row
+                entry_row = get_next_entry_row(ws, game_col)
+
+                # Add the entry
+                add_entry_to_game(ws, game_col, entry_row, result)
+
+                appended += 1
+
+            except Exception as e:
+                log_error(f"Error adding {result.game}: {e}")
 
         # Save once at the end
         wb.save(filepath)
         wb.close()
 
-        log_success(f"Appended {appended} rows to Excel")
+        log_success(f"Appended {appended} entries to Excel")
         return appended
 
     except Exception as e:
@@ -183,32 +353,77 @@ def append_results(results: List[GameScreenshotResult], filepath: Optional[Path]
         return 0
 
 
-def get_row_count(filepath: Optional[Path] = None) -> int:
+def get_sheet_names(filepath: Optional[Path] = None) -> List[str]:
+    """Get list of sheet names (dates) in the workbook."""
+    if filepath is None:
+        filepath = EXCEL_FILE_PATH
+
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        return []
+
+    try:
+        wb = load_workbook(filepath)
+        names = wb.sheetnames
+        wb.close()
+        return names
+    except Exception as e:
+        log_error(f"Error getting sheet names: {e}")
+        return []
+
+
+def get_entry_count(filepath: Optional[Path] = None, date_str: Optional[str] = None) -> Dict[str, int]:
     """
-    Get the number of data rows in the Excel file.
+    Get count of entries per game for a date.
 
     Args:
-        filepath: Path to the Excel file. Uses default if None.
+        filepath: Path to Excel file
+        date_str: Date to check (uses today if None)
 
     Returns:
-        Number of data rows (excluding header)
+        Dict mapping game_id to entry count
     """
+    if filepath is None:
+        filepath = EXCEL_FILE_PATH
+    if date_str is None:
+        date_str = get_today_date_str()
+
+    filepath = Path(filepath)
+    counts = {}
+
+    if not filepath.exists():
+        return counts
+
     try:
-        if filepath is None:
-            filepath = EXCEL_FILE_PATH
-
-        filepath = Path(filepath)
-
-        if not filepath.exists():
-            return 0
-
         wb = load_workbook(filepath)
-        ws = wb.active
-        row_count = ws.max_row - 1  # Subtract header row
+
+        if date_str not in wb.sheetnames:
+            wb.close()
+            return counts
+
+        ws = wb[date_str]
+
+        # Check each game column
+        col = 1
+        while col <= ws.max_column:
+            game_title = ws.cell(row=1, column=col).value
+            if game_title:
+                # Count entries for this game
+                entry_count = 0
+                row = HEADER_ROWS + 1
+                while row <= ws.max_row:
+                    if ws.cell(row=row + 1, column=col).value:  # Check timestamp row
+                        entry_count += 1
+                    row += ROWS_PER_ENTRY
+
+                counts[str(game_title)] = entry_count
+
+            col += COLUMNS_PER_GAME
 
         wb.close()
-        return max(0, row_count)
+        return counts
 
     except Exception as e:
-        log_error(f"Error getting row count: {e}")
-        return 0
+        log_error(f"Error getting entry count: {e}")
+        return counts
