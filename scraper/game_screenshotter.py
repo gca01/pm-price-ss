@@ -5,9 +5,10 @@ Handles navigating to the graph view and capturing screenshots.
 """
 
 import time
+import requests
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
@@ -49,6 +50,228 @@ class GameScreenshotResult:
     success: bool
     error_message: Optional[str] = None
     is_final: bool = False  # True if game has ended (shows "Final" on page)
+    home_low_price: Optional[float] = None  # Lowest price home team reached
+    away_low_price: Optional[float] = None  # Lowest price away team reached
+
+
+def fetch_price_history(market_id: str, interval: str = "max") -> List[Dict]:
+    """
+    Fetch price history from Polymarket CLOB API.
+
+    Args:
+        market_id: The market/token ID for the outcome
+        interval: Time interval - "6h", "1d", "1w", "max"
+
+    Returns:
+        List of {t: timestamp, p: price} dicts
+    """
+    try:
+        url = f"https://clob.polymarket.com/prices-history?interval={interval}&market={market_id}"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('history', [])
+    except Exception as e:
+        log_warning(f"Error fetching price history: {e}")
+    return []
+
+
+def get_min_price_from_history(history: List[Dict]) -> Optional[float]:
+    """
+    Get the minimum price from a price history list.
+
+    Args:
+        history: List of {t: timestamp, p: price} dicts
+
+    Returns:
+        Minimum price as float, or None if no data
+    """
+    if not history:
+        return None
+
+    prices = [entry.get('p', 1.0) for entry in history if 'p' in entry]
+    if prices:
+        return min(prices)
+    return None
+
+
+def extract_market_ids(page: Page) -> Dict[str, str]:
+    """
+    Extract market/token IDs from the page for each team.
+
+    Args:
+        page: Playwright page object (should be on game detail page)
+
+    Returns:
+        Dict mapping team abbreviation to market ID
+    """
+    try:
+        # The market IDs are often in data attributes or can be found in network requests
+        # We'll extract them from the price buttons which contain the token info
+        market_ids = page.evaluate('''() => {
+            const results = {};
+
+            // Look for buttons with price info that might have data attributes
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+                const text = btn.innerText || '';
+                // Match pattern like "PHX 87¢" or "OKC 13¢"
+                const match = text.match(/^([A-Z]{2,3})\\s*(\\d+)¢$/);
+                if (match) {
+                    const team = match[1];
+                    // Try to find token ID in parent elements or data attributes
+                    let el = btn;
+                    for (let i = 0; i < 10; i++) {
+                        if (!el) break;
+                        // Check for data attributes
+                        const attrs = el.attributes;
+                        for (let j = 0; j < attrs.length; j++) {
+                            const attr = attrs[j];
+                            if (attr.value && attr.value.length > 50 && /^\\d+$/.test(attr.value)) {
+                                results[team] = attr.value;
+                            }
+                        }
+                        el = el.parentElement;
+                    }
+                }
+            }
+
+            return results;
+        }''')
+
+        if market_ids:
+            log_info(f"Found market IDs: {market_ids}")
+            return market_ids
+
+    except Exception as e:
+        log_warning(f"Error extracting market IDs: {e}")
+
+    return {}
+
+
+def get_low_prices_from_api(page: Page, game: GameInfo) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Get the lowest prices each team reached using the Polymarket API.
+
+    The API returns away team prices. Home team price = 1 - away team price.
+    So: away_low = min(away_prices), home_low = 1 - max(away_prices)
+
+    Args:
+        page: Playwright page object (on game detail page)
+        game: GameInfo with team abbreviations
+
+    Returns:
+        Tuple of (home_low_price, away_low_price)
+    """
+    home_low = None
+    away_low = None
+
+    try:
+        # Extract market/token ID from the page URL or page content
+        # The token ID is needed to call the prices-history API directly
+
+        # Method: Extract from page's JavaScript context
+        market_id = page.evaluate('''() => {
+            // Look for token IDs in the page - they're usually long numeric strings
+            // Check script tags and data embedded in the page
+            const scripts = document.querySelectorAll('script');
+            for (const script of scripts) {
+                const text = script.textContent || '';
+                // Look for token patterns in JSON data
+                const matches = text.match(/"token"\\s*:\\s*"(\\d{70,80})"/g);
+                if (matches && matches.length > 0) {
+                    // Extract the first token ID
+                    const match = matches[0].match(/"(\\d{70,80})"/);
+                    if (match) return match[1];
+                }
+            }
+
+            // Also check for market IDs in URLs within the page
+            const allText = document.body.innerText;
+            const tokenMatch = allText.match(/\\b(\\d{70,80})\\b/);
+            if (tokenMatch) return tokenMatch[1];
+
+            return null;
+        }''')
+
+        if not market_id:
+            # Try to get it from network requests by reloading the graph
+            log_info("Trying to capture market ID from network...")
+            captured_ids = []
+
+            def capture_market_id(response):
+                if 'prices-history' in response.url:
+                    import re
+                    match = re.search(r'market=(\d+)', response.url)
+                    if match:
+                        captured_ids.append(match.group(1))
+
+            page.on("response", capture_market_id)
+
+            # Click a different time period to force a new request
+            try:
+                # First click 1D, then Max to force new requests
+                for btn_text in ["1D", "Max", "1W"]:
+                    btn = page.get_by_text(btn_text, exact=True)
+                    if btn.count() > 0:
+                        btn.first.click()
+                        time.sleep(1.5)
+                        if captured_ids:
+                            break
+            except:
+                pass
+
+            page.remove_listener("response", capture_market_id)
+
+            if captured_ids:
+                market_id = captured_ids[0]
+                log_info(f"Captured market ID: {market_id[:30]}...")
+
+        if market_id:
+            # Call the API directly - use 6h interval to match our graph timeframe
+            log_info(f"Fetching price history from API (6h)...")
+            url = f"https://clob.polymarket.com/prices-history?interval=6h&market={market_id}"
+            response = requests.get(url, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                history = data.get('history', [])
+
+                if history:
+                    # Filter to last 6 hours just in case API returns more
+                    import time as time_module
+                    six_hours_ago = time_module.time() - (6 * 60 * 60)
+
+                    # Filter prices to last 6 hours
+                    recent_prices = [
+                        entry.get('p', 0.5)
+                        for entry in history
+                        if 'p' in entry and entry.get('t', 0) >= six_hours_ago
+                    ]
+
+                    # If filtering removed all prices, use all prices from the response
+                    if not recent_prices:
+                        recent_prices = [entry.get('p', 0.5) for entry in history if 'p' in entry]
+
+                    log_info(f"Got {len(recent_prices)} price points from last 6 hours")
+
+                    if recent_prices:
+                        away_low = min(recent_prices)  # Lowest away team price in last 6h
+                        away_high = max(recent_prices)  # Highest away team price in last 6h
+                        home_low = 1 - away_high  # Home team's low = 1 - away team's high
+
+                        log_success(f"Low prices (6h) - {game.away}: {away_low:.2f}, {game.home}: {home_low:.2f}")
+                else:
+                    log_warning("API returned empty history")
+            else:
+                log_warning(f"API request failed with status {response.status_code}")
+        else:
+            log_warning("Could not find market ID for price history")
+
+    except Exception as e:
+        log_warning(f"Error getting low prices from API: {e}")
+
+    return home_low, away_low
 
 
 def check_if_game_final(page: Page) -> bool:
@@ -366,6 +589,13 @@ def process_game(page: Page, game: GameInfo, game_index: int) -> GameScreenshotR
         # Extract prices
         result.home_price, result.away_price = extract_moneyline_prices(page, game)
 
+        # Get low prices from API (by switching to "Max" time period)
+        result.home_low_price, result.away_low_price = get_low_prices_from_api(page, game)
+
+        # Switch back to 6H for screenshot
+        select_time_period(page, "6H")
+        time.sleep(1)
+
         # Capture screenshot
         result.screenshot_path = capture_chart_screenshot(page, game)
 
@@ -465,6 +695,13 @@ def process_game_by_url(page: Page, game: GameInfo) -> GameScreenshotResult:
 
         # Extract prices
         result.home_price, result.away_price = extract_moneyline_prices(page, game)
+
+        # Get low prices from API (by switching to "Max" time period)
+        result.home_low_price, result.away_low_price = get_low_prices_from_api(page, game)
+
+        # Switch back to 6H for screenshot
+        select_time_period(page, "6H")
+        time.sleep(1)
 
         # Capture screenshot
         result.screenshot_path = capture_chart_screenshot(page, game)

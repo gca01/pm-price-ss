@@ -62,23 +62,29 @@ def print_summary(results: List[GameScreenshotResult]):
     """Print a summary table of results."""
     table = Table(title="Scraping Results")
     table.add_column("Game", style="cyan")
-    table.add_column("Home Price", justify="right")
-    table.add_column("Away Price", justify="right")
+    table.add_column("Current", justify="right")
+    table.add_column("Low", justify="right", style="yellow")
     table.add_column("Screenshot", style="green")
     table.add_column("Final", justify="center")
     table.add_column("Status")
 
     for result in results:
         status = "[green]OK[/green]" if result.success else f"[red]{result.error_message}[/red]"
-        home_price = f"{result.home_price:.2f}" if result.home_price else "-"
-        away_price = f"{result.away_price:.2f}" if result.away_price else "-"
+        # Current prices
+        home_price = f"{int(result.home_price * 100)}¢" if result.home_price else "-"
+        away_price = f"{int(result.away_price * 100)}¢" if result.away_price else "-"
+        current = f"{result.game.away} {away_price} / {result.game.home} {home_price}"
+        # Low prices
+        home_low = f"{int(result.home_low_price * 100)}¢" if result.home_low_price else "-"
+        away_low = f"{int(result.away_low_price * 100)}¢" if result.away_low_price else "-"
+        low = f"{result.game.away} {away_low} / {result.game.home} {home_low}"
         screenshot = "Yes" if result.screenshot_path else "No"
         is_final = "[bold green]FINAL[/bold green]" if result.is_final else "-"
 
         table.add_row(
             str(result.game),
-            home_price,
-            away_price,
+            current,
+            low,
             screenshot,
             is_final,
             status,

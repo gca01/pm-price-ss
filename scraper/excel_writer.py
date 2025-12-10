@@ -12,10 +12,12 @@ Row 1: SAC @ IND           PHX @ MIN            MIA @ ORL
 Row 2: 1:00 PM / 2025-12-08  1:30 PM / 2025-12-08  2:00 PM / 2025-12-08
 Row 3: https://polymarket... https://polymarket... https://polymarket...
 Row 4: [Screenshot 1]      [Screenshot 1]       [Screenshot 1]
-Row 5: Captured: 06:00 AM  Captured: 06:00 AM   Captured: 06:00 AM
-Row 6: (blank)             (blank)              (blank)
-Row 7: [Screenshot 2]      [Screenshot 2]       [Screenshot 2]
-Row 8: Captured: 07:00 AM - FINAL  Captured: 07:00 AM  Captured: 07:00 AM
+Row 5: Lows: SAC 25¢ / IND 40¢  Lows: PHX 20¢ / MIN 30¢  ...
+Row 6: Captured: 06:00 AM  Captured: 06:00 AM   Captured: 06:00 AM
+Row 7: (blank)             (blank)              (blank)
+Row 8: [Screenshot 2]      [Screenshot 2]       [Screenshot 2]
+Row 9: Lows: SAC 22¢ / IND 38¢  Lows: PHX 18¢ / MIN 28¢  ...
+Row 10: Captured: 07:00 AM - FINAL  Captured: 07:00 AM  Captured: 07:00 AM
 ...
 """
 
@@ -36,7 +38,7 @@ from .game_screenshotter import GameScreenshotResult
 # Layout constants
 COLUMNS_PER_GAME = 3  # Each game takes 2 columns + 1 spacer column
 HEADER_ROWS = 3  # Row 1: Game title, Row 2: Start time, Row 3: URL
-ROWS_PER_ENTRY = 3  # Each hourly entry: Screenshot, Capture time, blank row
+ROWS_PER_ENTRY = 4  # Each hourly entry: Screenshot, Low prices, Capture time, blank row
 IMAGE_WIDTH = 350  # Screenshot width in pixels for Excel
 IMAGE_HEIGHT = 150  # Screenshot height in pixels for Excel
 
@@ -120,13 +122,15 @@ def is_game_final(ws, game_col: int) -> bool:
         True if the last entry contains "FINAL"
     """
     # Find the last entry row for this game
+    # Entry structure: Screenshot (row), Low prices (row+1), Timestamp (row+2), Blank (row+3)
     row = HEADER_ROWS + 1
     last_timestamp_row = None
 
     while row <= ws.max_row:
-        timestamp_cell = ws.cell(row=row + 1, column=game_col).value
-        if timestamp_cell:
-            last_timestamp_row = row + 1
+        # Timestamp is at row + 2 (after screenshot and low prices)
+        timestamp_cell = ws.cell(row=row + 2, column=game_col).value
+        if timestamp_cell and "Captured" in str(timestamp_cell):
+            last_timestamp_row = row + 2
         row += ROWS_PER_ENTRY
 
     if last_timestamp_row:
@@ -170,15 +174,25 @@ def find_game_column(ws, game_id: str) -> Optional[int]:
 
     Args:
         ws: Worksheet
-        game_id: Game ID to find
+        game_id: Game ID to find (format: "YYYY-MM-DD_Away_Home")
 
     Returns:
         Column number (1-based) or None if not found
     """
-    # Check row 1 for game IDs (stored in header)
+    # Parse game_id to get away and home teams
+    # Format: "YYYY-MM-DD_Away_Home"
+    parts = game_id.split("_")
+    if len(parts) < 3:
+        return None
+
+    away_team = parts[1]
+    home_team = parts[2]
+    expected_title = f"{away_team} @ {home_team}"
+
+    # Check row 1 for matching game title
     for col in range(1, ws.max_column + 1, COLUMNS_PER_GAME):
         cell_value = ws.cell(row=1, column=col).value
-        if cell_value and game_id in str(cell_value):
+        if cell_value and str(cell_value).strip() == expected_title:
             return col
     return None
 
@@ -210,7 +224,10 @@ def get_next_entry_row(ws, game_col: int) -> int:
     row = HEADER_ROWS + 1
 
     # Find the next empty entry slot
-    while ws.cell(row=row, column=game_col).value is not None:
+    # Entry structure: Screenshot (row), Low prices (row+1), Timestamp (row+2), Blank (row+3)
+    # Check the timestamp row (row + 2) since screenshot row may have None value
+    # even when an image is embedded there
+    while ws.cell(row=row + 2, column=game_col).value is not None:
         row += ROWS_PER_ENTRY
 
     return row
@@ -331,8 +348,31 @@ def add_entry_to_game(ws, game_col: int, entry_row: int, result: GameScreenshotR
         end_row=entry_row, end_column=game_col + 1
     )
 
-    # Row 2 of entry: Capture timestamp
-    time_row = entry_row + 1
+    # Row 2 of entry: Low prices (two separate cells, not merged)
+    low_row = entry_row + 1
+    home_low = getattr(result, 'home_low_price', None)
+    away_low = getattr(result, 'away_low_price', None)
+
+    # Away team low in first column
+    away_low_cell = ws.cell(row=low_row, column=game_col)
+    if away_low is not None:
+        away_low_cell.value = f"{result.game.away} Low: {away_low:.3f}"
+    else:
+        away_low_cell.value = f"{result.game.away} Low: -"
+    away_low_cell.font = Font(size=9, color="CC6600")  # Orange for low prices
+    away_low_cell.alignment = center_align
+
+    # Home team low in second column
+    home_low_cell = ws.cell(row=low_row, column=game_col + 1)
+    if home_low is not None:
+        home_low_cell.value = f"{result.game.home} Low: {home_low:.3f}"
+    else:
+        home_low_cell.value = f"{result.game.home} Low: -"
+    home_low_cell.font = Font(size=9, color="CC6600")  # Orange for low prices
+    home_low_cell.alignment = center_align
+
+    # Row 3 of entry: Capture timestamp
+    time_row = entry_row + 2
     timestamp = get_eastern_now().strftime("%I:%M %p")
 
     time_cell = ws.cell(row=time_row, column=game_col)
@@ -352,7 +392,7 @@ def add_entry_to_game(ws, game_col: int, entry_row: int, result: GameScreenshotR
         end_row=time_row, end_column=game_col + 1
     )
 
-    # Row 3 of entry: blank row (spacer between entries)
+    # Row 4 of entry: blank row (spacer between entries)
 
 
 def append_result(result: GameScreenshotResult, filepath: Optional[Path] = None) -> bool:
